@@ -1,8 +1,6 @@
 r""" ProtoFormer training (validation) code """
 import argparse
-import os
 import torch.optim as optim
-import torch.nn as nn
 import torch
 
 from model.protoformer import ProtoFormer
@@ -12,7 +10,32 @@ from common import utils
 from data.dataset import FSSDataset
 
 
-def train(epoch, model, dataloader, optimizer, training):
+# AMP API compat: prefer new torch.amp (torch>=2.4), fall back to legacy torch.cuda.amp
+if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+    def amp_autocast(device_type, enabled, dtype):
+        return torch.amp.autocast(device_type, dtype=dtype, enabled=enabled)
+
+    def make_grad_scaler(enabled):
+        return torch.amp.GradScaler('cuda', enabled=enabled)
+else:
+    from torch.cuda.amp import autocast as _legacy_autocast, GradScaler as _legacy_grad_scaler
+
+    def amp_autocast(device_type, enabled, dtype):
+        return _legacy_autocast(enabled=enabled, dtype=dtype)
+
+    def make_grad_scaler(enabled):
+        return _legacy_grad_scaler(enabled=enabled)
+
+
+def load_ckpt(path, device):
+    r""" torch.load with weights_only override (default flipped to True in torch>=2.6) """
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def train(epoch, model, dataloader, optimizer, training, amp=False, amp_dtype=torch.float16, scaler=None):
     r""" Train ProtoFormer """
 
     # Force randomness during training / freeze randomness during testing
@@ -23,16 +46,22 @@ def train(epoch, model, dataloader, optimizer, training):
     for idx, batch in enumerate(dataloader):
 
         batch = utils.to_cuda(batch)
+        with amp_autocast('cuda', amp, amp_dtype):
+            if training:
+                logit_mask = model(batch['query_img'], batch['support_imgs'], batch['support_masks'])
+                loss = model.compute_loss(logit_mask, batch['query_mask'])
+            else:
+                logit_mask = model.predict_mask(batch)
+        pred_mask=(logit_mask.float()>0.5).float().squeeze(1)
         if training:
-            logit_mask = model(batch['query_img'], batch['support_imgs'], batch['support_masks'])
-            loss = model.compute_loss(logit_mask, batch['query_mask'])
-        else:
-            logit_mask = model.predict_mask(batch)
-        pred_mask=(logit_mask>0.5).float().squeeze(1)
-        if training:           
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
         # 3. Evaluate prediction
         area_inter, area_union = Evaluator.classify_prediction(pred_mask, batch)
@@ -62,10 +91,14 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--niter', type=int, default=30)
     parser.add_argument('--nworker', type=int, default=4)
+    parser.add_argument('--nworker_val', type=int, default=0)
     parser.add_argument('--layers', type=int, default=50)
     parser.add_argument('--reduce_dim', type=int, default=64)
     parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument('--shot',type=int, default=1)
+    parser.add_argument('--amp', action='store_true')
+    parser.add_argument('--amp_dtype', type=str, default='auto', choices=['auto', 'float16', 'bfloat16'])
+    parser.add_argument('--resume', type=str, default='', help='path to last_ckpt.pt to resume from')
     args = parser.parse_args()
     Logger.initialize(args, training=True)
 
@@ -77,6 +110,18 @@ if __name__ == '__main__':
     Logger.info('# available GPUs: %d' % torch.cuda.device_count())
     model.to(device)
 
+    # Mixed precision setup (autocast + GradScaler; scaler only needed for float16)
+    amp = args.amp and device.type == 'cuda'
+    if args.amp_dtype == 'auto':
+        amp_dtype_name = 'bfloat16' if (amp and torch.cuda.is_bf16_supported()) else 'float16'
+    else:
+        amp_dtype_name = args.amp_dtype
+    amp_dtype = torch.bfloat16 if amp_dtype_name == 'bfloat16' else torch.float16
+    scaler = make_grad_scaler(amp and amp_dtype == torch.float16)
+    Logger.info('AMP: %s (dtype=%s, bf16_supported=%s)' % (
+        amp, amp_dtype_name if amp else 'off',
+        torch.cuda.is_bf16_supported() if device.type == 'cuda' else False))
+
     # Helper classes (for training) initialization
     optimizer = optim.Adam([{"params": model.parameters(), "lr": args.lr}])
     Evaluator.initialize()
@@ -84,20 +129,39 @@ if __name__ == '__main__':
     # Dataset initialization
     FSSDataset.initialize(img_size=473, datapath=args.datapath)
     dataloader_trn = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'trn',shot=args.shot)
-    dataloader_val = FSSDataset.build_dataloader(args.benchmark, 1, args.nworker, args.fold, 'val',shot=args.shot)
+    dataloader_val = FSSDataset.build_dataloader(args.benchmark, 1, args.nworker_val, args.fold, 'val',shot=args.shot)
 
     best_val_miou = float('-inf')
     best_val_loss = float('inf')
+    start_epoch = 0
 
-    for epoch in range(args.niter):
-        trn_loss, trn_miou, trn_fb_iou = train(epoch, model, dataloader_trn, optimizer, training=True)
+    # Resume training state if requested
+    if args.resume:
+        ckpt = load_ckpt(args.resume, device)
+        model.load_state_dict(ckpt['model'])
+        if ckpt.get('optimizer') is not None:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        if scaler is not None and ckpt.get('scaler') is not None:
+            scaler.load_state_dict(ckpt['scaler'])
+        start_epoch = ckpt.get('epoch', -1) + 1
+        best_val_miou = ckpt.get('best_val_miou', best_val_miou)
+        best_val_loss = ckpt.get('best_val_loss', best_val_loss)
+        Logger.info('Resumed @%s -> start epoch %d (best_val_miou=%s)' % (args.resume, start_epoch, best_val_miou))
+
+    for epoch in range(start_epoch, args.niter):
+        trn_loss, trn_miou, trn_fb_iou = train(epoch, model, dataloader_trn, optimizer, training=True, amp=amp, amp_dtype=amp_dtype, scaler=scaler)
         with torch.no_grad():
-            val_loss, val_miou, val_fb_iou = train(epoch, model, dataloader_val, optimizer, training=False)
+            val_loss, val_miou, val_fb_iou = train(epoch, model, dataloader_val, optimizer, training=False, amp=amp, amp_dtype=amp_dtype, scaler=scaler)
 
         # Save the best model
         if val_miou > best_val_miou:
             best_val_miou = val_miou
             Logger.save_model_miou(model, epoch, val_miou)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+
+        # Save resumable checkpoint every epoch
+        Logger.save_checkpoint(model, optimizer, scaler, epoch, best_val_miou, best_val_loss)
 
         Logger.tbd_writer.add_scalars('data/loss', {'trn_loss': trn_loss, 'val_loss': val_loss}, epoch)
         Logger.tbd_writer.add_scalars('data/miou', {'trn_miou': trn_miou, 'val_miou': val_miou}, epoch)

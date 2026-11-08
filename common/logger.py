@@ -7,12 +7,15 @@ from tensorboardX import SummaryWriter
 import torch
 
 
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 class AverageMeter:
     r""" Stores loss, evaluation results """
     def __init__(self, dataset):
         self.benchmark = dataset.benchmark
         self.class_ids_interest = dataset.class_ids
-        self.class_ids_interest = torch.tensor(self.class_ids_interest).cuda()
+        self.class_ids_interest = torch.tensor(self.class_ids_interest, device=DEVICE)
 
         if self.benchmark == 'pascal':
             self.nclass = 20
@@ -21,8 +24,8 @@ class AverageMeter:
         elif self.benchmark == 'fss':
             self.nclass = 1000
 
-        self.intersection_buf = torch.zeros([2, self.nclass]).float().cuda()
-        self.union_buf = torch.zeros([2, self.nclass]).float().cuda()
+        self.intersection_buf = torch.zeros([2, self.nclass], device=DEVICE).float()
+        self.union_buf = torch.zeros([2, self.nclass], device=DEVICE).float()
         self.ones = torch.ones_like(self.union_buf)
         self.loss_buf = []
 
@@ -115,6 +118,19 @@ class Logger:
     def save_model_miou(cls, model, epoch, val_miou):
         torch.save(model.state_dict(), os.path.join(cls.logpath, 'best_model.pt'))
         cls.info('Model saved @%d w/ val. mIoU: %5.2f.\n' % (epoch, val_miou))
+
+    @classmethod
+    def save_checkpoint(cls, model, optimizer, scaler, epoch, best_val_miou, best_val_loss):
+        r""" Save resumable state (model + optimizer + AMP scaler + progress) """
+        ckpt = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict() if optimizer is not None else None,
+            'scaler': scaler.state_dict() if scaler is not None else None,
+            'epoch': epoch,
+            'best_val_miou': best_val_miou,
+            'best_val_loss': best_val_loss,
+        }
+        torch.save(ckpt, os.path.join(cls.logpath, 'last_ckpt.pt'))
 
     @classmethod
     def log_params(cls, model):

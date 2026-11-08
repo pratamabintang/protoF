@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from .resnet import *
 from .loss import WeightedDiceLoss
 from .backbone_utils import Backbone
 from .transformer import PositionEmbeddingSine
@@ -18,7 +17,6 @@ class ProtoFormer(nn.Module):
     def __init__(self, layers=50, shot=1, reduce_dim=64, criterion=WeightedDiceLoss()):
         super(ProtoFormer, self).__init__()
         assert layers in [50, 101]
-        assert classes > 1 
         self.layers = layers
         self.criterion = criterion
         self.shot = shot
@@ -108,9 +106,15 @@ class ProtoFormer(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
 
-    def forward(self, x, s_x=torch.FloatTensor(1,1,3,473,473).cuda(), s_y=torch.FloatTensor(1,1,473,473).cuda()):
+    def forward(self, x, s_x=None, s_y=None):
         batch_size, C, h, w = x.size()
         img_size = x.size()[-2:]
+
+        # Device-agnostic defaults: build on x's device/dtype so this works on CPU too
+        if s_x is None:
+            s_x = x.new_zeros((1, 1, 3, *img_size))
+        if s_y is None:
+            s_y = x.new_zeros((1, 1, *img_size))
 
         # backbone feature extraction
         qry_bcb_fts = self.backbone(x)

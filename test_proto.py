@@ -1,8 +1,6 @@
 r""" Hypercorrelation Squeeze testing code """
 import argparse
 
-import torch.nn.functional as F
-import torch.nn as nn
 import torch
 
 from model.protoformer import ProtoFormer
@@ -74,7 +72,11 @@ if __name__ == '__main__':
 
     # Load trained model
     if args.load == '': raise Exception('Pretrained model not specified.')
-    model.load_state_dict(torch.load(args.load))
+    try:
+        state_dict = torch.load(args.load, map_location=device, weights_only=False)
+    except TypeError:
+        state_dict = torch.load(args.load, map_location=device)
+    model.load_state_dict(state_dict)
 
     # Helper classes (for testing) initialization
     Evaluator.initialize()
